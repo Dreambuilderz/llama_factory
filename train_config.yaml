@@ -1,0 +1,324 @@
+# AI Video Generation Pipeline
+## Full Architecture for 1-Hour Consistent-Character Videos
+
+---
+
+## System Overview
+
+```
+TREND DATA → SCRIPT → SCENES → VIDEO CLIPS → AUDIO → ASSEMBLE → FINAL VIDEO
+  (YT API)   (LLM)  (720x5s)  (Wan/CogVX)  (TTS+Music)  (FFmpeg)  (1hr MP4)
+```
+
+---
+
+## Stack
+
+| Layer | Tool | Notes |
+|---|---|---|
+| Script Gen | Qwen3-VL-235B or Claude API | Long context, structured JSON output |
+| Video Gen | **Wan2.1-14B** (recommended) | Best open-source quality as of 2025 |
+| Alt Video Gen | CogVideoX-5B | Faster, slightly lower quality |
+| Character Consistency | IP-Adapter + character LoRA | Reference image injected every clip |
+| TTS | **Chatterbox TTS** (Resemble AI) | Emotional, natural, free/open |
+| Alt TTS | Kokoro-82M | Fastest local option |
+| Music | MusicGen-Large (Meta AudioCraft) | 30s loops, mood-matched |
+| Assembly | **FFmpeg** | Concat + audio sync + transitions |
+| Orchestration | Python + Ray | Parallel GPU clip generation |
+| Storage | Local NVMe or S3 | 720 clips ~50GB raw |
+
+---
+
+## Hardware Requirements
+
+| Config | GPU | VRAM | Speed (720 clips) |
+|---|---|---|---|
+| Minimum | 1x RTX 4090 | 24GB | ~36 hours |
+| Recommended | 4x RTX 4090 | 96GB | ~9 hours |
+| Fast | 8x A100 80GB | 640GB | ~2 hours |
+| Cloud burst | 8x H100 (Lambda/RunPod) | 640GB | ~1 hour |
+
+---
+
+## Character Consistency System
+
+### Option A: IP-Adapter (no training required)
+```python
+# Inject reference image into every generation call
+pipeline.set_ip_adapter_scale(0.7)  # 0.6-0.8 sweet spot
+result = pipeline(
+    prompt=f"ALEXCHAR, {scene_prompt}",
+    ip_adapter_image=character_reference_image,
+    ...
+)
+```
+**Pros:** No training, works immediately  
+**Cons:** ~70-80% facial consistency, drifts on complex poses
+
+### Option B: Character LoRA (recommended for production)
+```bash
+# Train on 15-30 images of your character (real or generated)
+# Using kohya_ss or SimpleTuner
+python train_network.py \
+  --pretrained_model_name_or_path="Wan-AI/Wan2.1-14B" \
+  --train_data_dir="./character_images" \
+  --output_dir="./character_lora" \
+  --resolution=512 \
+  --max_train_steps=1500 \
+  --learning_rate=1e-4 \
+  --network_module=networks.lora \
+  --trigger_word="ALEXCHAR"
+```
+**Pros:** 95%+ consistency, works at any pose/angle  
+**Cons:** Needs 30min training on A100, requires source images
+
+### Option C: Both (production standard)
+Load the LoRA + IP-Adapter together. LoRA handles character identity, IP-Adapter handles expression/pose coherence.
+
+---
+
+## Clip Generation Loop
+
+```python
+import ray
+from wan_pipeline import WanVideoPipeline  # pseudocode, use actual Wan2.1 loader
+
+@ray.remote(num_gpus=1)
+class VideoWorker:
+    def __init__(self, gpu_id: int):
+        self.pipeline = WanVideoPipeline.from_pretrained(
+            "Wan-AI/Wan2.1-T2V-14B",
+            torch_dtype=torch.bfloat16,
+        ).to(f"cuda:{gpu_id}")
+        self.pipeline.load_lora_weights("./character_lora")
+        self.pipeline.load_ip_adapter("h94/IP-Adapter-FaceID")
+        
+    def generate_clip(self, scene: dict, char_ref: str) -> str:
+        output_path = f"./clips/scene_{scene['scene_id']:04d}.mp4"
+        if os.path.exists(output_path):
+            return output_path  # skip if already generated (resumable)
+        
+        frames = self.pipeline(
+            prompt=scene["prompt"],
+            negative_prompt=scene["negative_prompt"],
+            ip_adapter_image=Image.open(char_ref),
+            ip_adapter_scale=0.72,
+            num_frames=scene["num_frames"],   # 5s * 10fps = 50 frames
+            num_inference_steps=30,
+            guidance_scale=6.0,
+            width=1920,
+            height=1080,
+        ).frames[0]
+        
+        export_to_video(frames, output_path, fps=10)
+        return output_path
+
+
+def run_generation(pipeline_json: str, num_gpus: int = 4):
+    with open(pipeline_json) as f:
+        data = json.load(f)
+    
+    scenes = data["pipeline_inputs"]["video_generation"]
+    char_ref = "./character_reference.png"
+    
+    ray.init()
+    workers = [VideoWorker.remote(i) for i in range(num_gpus)]
+    
+    # Distribute scenes across workers
+    futures = []
+    for i, scene in enumerate(scenes):
+        worker = workers[i % num_gpus]
+        futures.append(worker.generate_clip.remote(scene, char_ref))
+    
+    # Collect results with progress
+    clip_paths = []
+    for i, future in enumerate(futures):
+        path = ray.get(future)
+        clip_paths.append(path)
+        print(f"Progress: {i+1}/{len(scenes)} clips ({(i+1)/len(scenes)*100:.1f}%)")
+    
+    return clip_paths
+```
+
+---
+
+## TTS Narration Generation
+
+```python
+import torchaudio
+from chatterbox.tts import ChatterboxTTS  # pip install chatterbox-tts
+
+def generate_narration(narration_json: str, voice_ref: str = None) -> list[str]:
+    """Generate TTS for all narration lines."""
+    model = ChatterboxTTS.from_pretrained(device="cuda")
+    
+    with open(narration_json) as f:
+        lines = json.load(f)
+    
+    audio_paths = []
+    for line in lines:
+        if not line["text"].strip():
+            continue
+        
+        output_path = f"./narration/scene_{line['scene_id']:04d}.wav"
+        
+        wav = model.generate(
+            line["text"],
+            audio_prompt_path=voice_ref,  # clone your character's voice
+            exaggeration=0.4,  # 0=neutral, 1=very expressive
+            cfg_weight=0.5,
+        )
+        torchaudio.save(output_path, wav, model.sr)
+        audio_paths.append({"scene_id": line["scene_id"], "path": output_path})
+    
+    return audio_paths
+```
+
+---
+
+## FFmpeg Assembly Pipeline
+
+```python
+import subprocess
+import os
+
+def assemble_final_video(
+    clip_paths: list[str],
+    narration_paths: list[dict],
+    output_path: str = "final_video.mp4"
+):
+    """Assemble all clips + narration into final video."""
+    
+    # Step 1: Write clip concat list
+    concat_list = "concat_list.txt"
+    with open(concat_list, "w") as f:
+        for clip in sorted(clip_paths):
+            f.write(f"file '{os.path.abspath(clip)}'\n")
+    
+    # Step 2: Concatenate all video clips (no re-encode = fast)
+    raw_video = "raw_concat.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_list, "-c", "copy", raw_video
+    ], check=True)
+    
+    # Step 3: Concatenate narration audio files
+    narration_concat = "narration_concat.txt"
+    with open(narration_concat, "w") as f:
+        for item in sorted(narration_paths, key=lambda x: x["scene_id"]):
+            f.write(f"file '{os.path.abspath(item['path'])}'\n")
+    
+    raw_audio = "narration_full.wav"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", narration_concat, "-c", "copy", raw_audio
+    ], check=True)
+    
+    # Step 4: Merge video + narration audio
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", raw_video,
+        "-i", raw_audio,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest",
+        output_path
+    ], check=True)
+    
+    print(f"✅ Final video: {output_path}")
+    return output_path
+
+
+def add_background_music(
+    video_path: str,
+    music_path: str,
+    output_path: str,
+    music_volume: float = 0.15  # keep music under narration
+):
+    """Mix background music under narration audio."""
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", music_path,
+        "-filter_complex",
+        f"[1:a]volume={music_volume},aloop=loop=-1:size=2e+09[music];"
+        "[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        output_path
+    ], check=True)
+```
+
+---
+
+## Full Pipeline Runner
+
+```python
+async def run_full_pipeline(topic: str = None):
+    # 1. Generate script
+    os.makedirs("clips", exist_ok=True)
+    os.makedirs("narration", exist_ok=True)
+    
+    from script_generator import main as gen_script
+    script_data = await gen_script(topic)
+    
+    # Save pipeline JSON
+    pipeline_json = "pipeline_latest.json"
+    with open(pipeline_json, "w") as f:
+        json.dump(script_data, f)
+    
+    # 2. Generate video clips (parallel on N GPUs)
+    print("\n🎬 Generating video clips...")
+    clip_paths = run_generation(pipeline_json, num_gpus=4)
+    
+    # 3. Generate narration audio
+    print("\n🎙 Generating narration audio...")
+    narration_json = pipeline_json.replace("pipeline", "narration")
+    narration_paths = generate_narration(narration_json, voice_ref="./voice_reference.wav")
+    
+    # 4. Assemble
+    print("\n🎞 Assembling final video...")
+    raw_output = "final_raw.mp4"
+    assemble_final_video(clip_paths, narration_paths, raw_output)
+    
+    # 5. Add background music
+    final_output = f"final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+    add_background_music(raw_output, "./music/ambient_loop.mp3", final_output)
+    
+    print(f"\n✅ Pipeline complete: {final_output}")
+
+if __name__ == "__main__":
+    asyncio.run(run_full_pipeline())
+```
+
+---
+
+## Anti-Glitch Checklist
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Character face changes between clips | No LoRA / IP-Adapter | Train character LoRA, use ip_adapter_scale=0.7 |
+| Jittery motion at clip boundaries | Different frame rates | Normalize all clips to same fps before concat |
+| Audio/video desync | Varying clip durations | Use `-shortest` flag, validate clip durations before assembly |
+| Color flickering between clips | Different CFG scales | Lock guidance_scale=6.0 across all clips |
+| Location inconsistency | Vague location prompts | Include specific location in every prompt, not just first |
+| Background music cuts out | Music shorter than video | Use `aloop=loop=-1` in FFmpeg to loop music |
+
+---
+
+## File Output Structure
+
+```
+output/
+├── clips/
+│   ├── scene_0001.mp4   # 5s clips
+│   ├── scene_0002.mp4
+│   └── ... (720 total)
+├── narration/
+│   ├── scene_0001.wav
+│   └── ...
+├── pipeline_latest.json  # full structured script
+├── final_raw.mp4         # assembled, no music
+└── final_20250604.mp4    # final with music ✅
+```
