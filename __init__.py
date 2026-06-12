@@ -1,78 +1,208 @@
-# llama-studio
-WebUI for managing llama-server sessions
+"""Parse llama-server -h output and generate schema."""
 
-This tool allows you to launch various llm models onto various llama-server sessions, fiddle with and save custom configurations, and launch llama-server sessions to various GPU up the the VRAM limit.  It is intended for the use case where you want fixed models on fixed ports for interaction with other toolsets, but can be used to play around as well.
+import subprocess
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Optional, Dict, List
 
-Currently tested only on NVIDIA devices.  Consider this a MVP (Minimum Viable Product) release
+logger = logging.getLogger(__name__)
 
-# What's new in 0.2.0
-- **Model configs converted to executable shell scripts. No more JSON for models** Each model lives at `config/models/<name>.sh`. Self-contained, portable, runnable directly from the CLI. Existing JSON configs are migrated automatically on first start (originals kept as `.json.old`).
-- **Paste-in support.** The config modal has an Edit textarea: paste an Unsloth-style snippet and it parses straight into the form.
-- **Multi-GPU model splitting.** Add `--tensor-split a,b,…` to a model's args and the GPU picker switches to multi-slot mode. Per-GPU VRAM share is honored on availability checks.
-- **Auto-load on startup.** "Store this state to autoload" snapshots the currently-loaded set into `app.json`; toggle "Load on startup" and they come back on next launch. Runs in the background so the WebUI is responsive while models load.
-- **Save-while-loaded warning.** Editing a loaded model's config prompts to unload or keep the prior load.
-- **VRAM calculator fix.** Cross-model contamination bug squashed (every modal now reads fresh values).
+def parse_help(binary_path: str) -> Optional[Dict]:
+    """
+    Run llama-server -h and parse help text.
 
-# Gallery
-## Main Page
-- GPU Panel: Shows status of all GPU, including Power, Temp, VRAM Usage, and any sessions running on this GPU with URL to llama-server's mini webUI for testing
-- Model Table: Shows status of all scanned models.  Click to Load, Unload, View console Log, or edit Configuration/Launch Args
-<p align="left">
-<img width="512" alt="1_llama_server_main" src="https://github.com/user-attachments/assets/e9b666c9-6c32-4829-8777-2dd2a731562e" />
-</p>
+    Returns a dict like:
+    {
+        "-c": {
+            "type": "int",
+            "short": "-c",
+            "long": "--ctx-size",
+            "description": "context size",
+            "category": "context"
+        },
+        ...
+    }
+    """
+    try:
+        binary_path = Path(binary_path)
+        if not binary_path.exists():
+            logger.warning(f"⚠ Binary not found: {binary_path}")
+            return None
 
-## Simple Setup
-Just point out the path of llama-server binary and model dir.  The llama-server binary will be tested with -version and --help to extract all command line arguments, and they will be stored for easy confguration later.  The model dir will be scanned for GGUF files and they will be added to the model table for config & launching.
-<p align="left">
-<img width="512"  alt="1a_initial_setup" src="https://github.com/user-attachments/assets/bc59114c-f251-49ff-801d-12568205b48a" />
+        result = subprocess.run(
+            [str(binary_path), "-h"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
 
-</p>
+        if result.returncode != 0:
+            logger.warning(f"⚠ llama-server -h returned code {result.returncode}")
+            return None
 
-## GPU Selection
-Clicking Load on a model allows selection of GPU.  Load as many sessions as your GPU will hold.
-In the example here, Qwen 3.6 is too big to fit on GPU 0 & 1, but could load to 2 or 3.  Adjust KV quant and context to pack more models per GPU, or dedicate whole GPU to maximize context.
-<p align="left">
-  <img width="512" alt="2_llama_server_gpu_selection" src="https://github.com/user-attachments/assets/c57a8a69-e7ee-4217-9487-e3808a88b554" />
-</p> 
+        # Combine stdout and stderr in case help text is on stderr
+        combined_output = result.stdout + result.stderr
+        schema = _parse_help_text(combined_output)
+        logger.info(f"✓ Parsed {len(schema)} options from llama-server help")
+        return schema
 
-## Model Configuration
-Since the tool is running llama-server sessions, the config is based around launch args.  But there is a rudimentary VRAM calculator for optimizing context and KV quantization in order to pack as much context into your VRAM as you can, without enlessly failing loads.
-<p align="left">
-<img width="512" alt="3_model_config" src="https://github.com/user-attachments/assets/9c19e4dd-07c4-4a8d-b1ad-7a2a7652890d" />
-</p>
-
-## Option Browser
-Uses the real arg list parsed from **llama-server --help** to make a clickable, searchable table of options to add to launch args.  Nice if you don't like memorizing CLI args
-<p align="left">
-<img width="512" alt="4_option_browser" src="https://github.com/user-attachments/assets/33c6ee23-7471-41b9-b542-f58ae2a0b0d0" />
-</p>
+    except subprocess.TimeoutExpired:
+        logger.warning("⚠ llama-server -h timed out (timeout=10s)")
+        return None
+    except Exception as e:
+        logger.warning(f"⚠ Error parsing help: {e}")
+        return None
 
 
-# Quickstart
-## 1. Clone the repository
-git clone https://github.com/m94301/llama-studio.git
+def _parse_help_text(help_text: str) -> Dict:
+    """
+    Parse help text output. Extract options and descriptions.
 
-cd llama-studio
+    Help format (typical llama.cpp):
+      -c, --ctx-size N            context size (default: 512)
+      -ngl, --gpu-layers, --n-gpu-layers N      number of layers to offload to GPU
+      ...
 
-## 2. Create a virtual environment (So my python imports don't pollute your main environment)
-python3 -m venv venv
+    Returns dict keyed by primary option name (prefer long form). All aliases
+    point to the same entry.
+    """
+    schema = {}
+    lines = help_text.split('\n')
 
-source venv/bin/activate
+    for line in lines:
+        # Match lines with option flags (handle multiple comma-separated aliases)
+        # Pattern: whitespace + option(s) + non-letter content (param indicator, spacing) + description
+        match = re.match(r'\s*((?:-[\w-]+(?:,\s+)*)+)\s+([^\s].+)', line)
+        if not match:
+            continue
 
-## 3. Install dependencies
-pip install -r requirements.txt
+        options_str = match.group(1)
+        desc_and_default = match.group(2)
 
-## 4. Run the app (with setup guide)
-./start.sh
+        # Parse all option aliases from the comma-separated list
+        options = [opt.strip() for opt in options_str.split(',') if opt.strip()]
+        if not options:
+            continue
 
-# Requirements (For reference)
-You can see it in requirements.txt, but just to note it here.  Tried to keep it as light as possible
-- fastapi==0.115.5
-- uvicorn[standard]==0.30.6
-- pydantic==2.10.4
-- pynvml>=12.0.0
-- httpx==0.28.1
-- python-multipart==0.0.9
-- jinja2>=3.1.0
-- gguf_parser>=0.0.6
+        # Separate short and long forms
+        shorts = [o for o in options if o.startswith('-') and not o.startswith('--')]
+        longs = [o for o in options if o.startswith('--')]
 
+        # Prefer long form for key; fall back to first short
+        primary_key = longs[0] if longs else shorts[0]
+        secondary_keys = (shorts + longs[1:]) if longs else shorts[1:]
+
+        # Extract description (before any "default:" marker or param indicator)
+        # Remove leading "N", "INDEX", etc.
+        desc = re.sub(r'^[A-Z_0-9{}\[\],.\s]+\s+', '', desc_and_default).strip()
+        desc = desc.split('(default:')[0].strip()
+        desc = desc.split('(env:')[0].strip()
+
+        # Infer type: if description mentions "N", "number", "count", it's int
+        option_type = _infer_type(desc, desc_and_default)
+
+        entry = {
+            "type": option_type,
+            "description": desc,
+            "category": _infer_category(primary_key),
+        }
+
+        # Store under primary key and all secondary keys
+        schema[primary_key] = entry
+        for key in secondary_keys:
+            if key not in schema:
+                schema[key] = entry
+
+    return schema
+
+
+def _infer_type(description: str, full_text: str) -> str:
+    """Infer whether an option takes an int or str value.
+
+    Primary signal: the parameter indicator (the first whitespace-separated token
+    after the flag in llama-server's help output). llama.cpp uses standardized
+    indicators — N / INT / NUM / SIZE for numeric, HOST / PATH / STRING / FILE
+    etc. for textual.
+
+    Falls back to a tight keyword scan of the description only (the looser scan of
+    full_text caused false positives like 'listen (' matching 'n ').
+    """
+    # Extract the parameter indicator (first token in the post-flag remainder)
+    m = re.match(r"\s*(\S+)", full_text or "")
+    if m:
+        param = m.group(1)
+        # All-caps numeric indicators
+        if param in {"N", "INT", "NUM", "NUMBER", "COUNT", "SIZE", "INDEX", "PORT", "LAYERS"}:
+            return "int"
+        # All-caps single word that isn't a known int indicator → string-typed param
+        # (HOST, PATH, STRING, FILE, NAME, TEMPLATE, ALIAS, URL, JSON, etc.)
+        if len(param) >= 2 and param.isalpha() and param.isupper():
+            return "str"
+
+    # Tight description-only fallback: only well-known numeric keywords
+    desc_lower = (description or "").lower()
+    if any(kw in desc_lower for kw in ("number of", "count of", "size of", "layers to", "threads to")):
+        return "int"
+    return "str"
+
+
+def _infer_category(option_key: str) -> str:
+    """Categorize an option based on its name."""
+    key_lower = option_key.lower()
+    if any(x in key_lower for x in ["host", "port", "addr", "listen"]):
+        return "networking"
+    if any(x in key_lower for x in ["gpu", "ngl", "cuda", "vulkan"]):
+        return "gpu"
+    if any(x in key_lower for x in ["ctx", "context", "seq"]):
+        return "context"
+    if any(x in key_lower for x in ["thread", "parallel", "np"]):
+        return "threading"
+    if any(x in key_lower for x in ["batch", "ubatch", "prompt", "cache"]):
+        return "performance"
+    if any(x in key_lower for x in ["spec", "draft"]):
+        return "speculative"
+    return "other"
+
+
+def save_schema(schema: Dict, version_str: str, config_dir: Path) -> Path:
+    """
+    Save schema to config/llama-server/{version_str}.json.
+
+    Returns the path to the saved file.
+    """
+    schema_dir = config_dir / "llama-server"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+
+    schema_file = schema_dir / f"{version_str}.json"
+
+    try:
+        with open(schema_file, "w") as f:
+            json.dump(schema, f, indent=2)
+        logger.info(f"✓ Saved schema: {schema_file}")
+        return schema_file
+    except Exception as e:
+        logger.error(f"✗ Error saving schema: {e}")
+        raise
+
+
+def load_schema(version_str: str, config_dir: Path) -> Optional[Dict]:
+    """
+    Load cached schema for a given version.
+
+    Returns the schema dict, or None if not found.
+    """
+    schema_file = config_dir / "llama-server" / f"{version_str}.json"
+
+    if not schema_file.exists():
+        return None
+
+    try:
+        with open(schema_file) as f:
+            schema = json.load(f)
+        logger.info(f"✓ Loaded cached schema: {schema_file}")
+        return schema
+    except Exception as e:
+        logger.warning(f"⚠ Error loading schema: {e}")
+        return None

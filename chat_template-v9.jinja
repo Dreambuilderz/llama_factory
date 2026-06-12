@@ -1,24 +1,17 @@
-<!-- frontend/templates/modals/unload_confirm.html -->
-{% extends "base_modal.html" %}
-{% set title = "Unload Model?" %}
-{% set title_class = "text-red-400" %}
-{% set border_color = "red-600" %}
-
-{% block content %}
-<p class="text-sm text-gray-300 mb-6">
-    Unload <span class="font-bold text-blue-400">{{ display_name }}</span>?
-    This will terminate the llama.cpp instance.
-</p>
-<div class="flex gap-3">
-    <button onclick="document.getElementById('modal').remove();"
-            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-        Cancel
-    </button>
-    <button hx-post="/api/trigger-unload"
-            hx-vals='{"model_name": "{{ model_name }}"}'
-            hx-target="#modal-container" hx-swap="innerHTML"
-            class="flex-1 px-4 py-2 rounded bg-red-600 hover:bg-red-500 text-white font-bold transition-colors">
-        Unload
-    </button>
+<!-- frontend/templates/snippets/gpu_card.html -->
+<div class="border-2 border-gray-600 rounded p-6 bg-gray-800 w-full">
+    <div>
+        <h3 class="font-bold text-sm">
+            GPU {{ gpu.gpu_id }} : {{ gpu.name }} : {{ gpu.power_draw|default(0)|round(0)|int }} W, {{ gpu.temperature|default('--') }} °C
+        </h3>
+    </div>
+    <div class="text-right text-sm text-gray-200">
+        <p>{{ gpu.allocated|round(1) }} / {{ gpu.memory|round(1) }} GB ({{ memory_pct|round(1) }}% used)</p>
+    </div>
+    <div class="relative w-full h-8 rounded overflow-hidden bg-gray-900">
+        <div class="h-full rounded bg-blue-500" style="width: {{ memory_pct|round(1) }}%"></div>
+        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <span class="text-white font-bold text-sm drop-shadow">VRAM Usage</span>
+        </div>
+    </div>
 </div>
-{% endblock %}
